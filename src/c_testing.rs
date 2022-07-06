@@ -72,16 +72,12 @@ pub fn invoke_testing() -> String {
     }
 
     match run_testing() {
-        Err(error) => {
-            serde_json::to_string(&InitialError {
-                compilation_message: None,
-                internal_error: Some(error),
-            })
-            .unwrap()
-        }
-        Ok(list) => {
-            serde_json::to_string(&list).unwrap()
-        }
+        Err(error) => serde_json::to_string(&InitialError {
+            compilation_message: None,
+            internal_error: Some(error),
+        })
+        .unwrap(),
+        Ok(list) => serde_json::to_string(&list).unwrap(),
     }
 }
 
@@ -131,7 +127,7 @@ fn test(in_file: &PathBuf, out_file: &PathBuf) -> Result<TestOutcome, TestError>
     };
 
     match process_spawn
-        .wait_timeout(Duration::from_secs(crate::TESTING_TIMEOUT_TIME_SECS as u64))
+        .wait_timeout(Duration::from_millis(*crate::TESTING_TIMEOUT_TIME_MILLS))
         .unwrap()
     {
         Some(status) => {
