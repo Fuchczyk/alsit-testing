@@ -1,4 +1,6 @@
 use lazy_static::lazy_static;
+use serde::Serialize;
+use std::collections::LinkedList;
 
 mod c_testing;
 
@@ -18,6 +20,64 @@ lazy_static! {
     };
 }
 
+#[derive(Serialize)]
+pub enum TestingOutcome {
+    Success,
+    Timeout,
+    MemoryExceeded,
+    WrongOutput,
+    SlightlyWrongOutput,
+    InternalError,
+}
+
+#[derive(Serialize, Clone)]
+pub enum TestLog {
+    Success { time: u64, memory: f64 },
+    Timeout { time_limit_millis: u64 },
+    MemoryExceeded { memory_used: f64 },
+    WrongOutput { expected: String, got: String },
+    SlightlyWrongOutput { expected: String, got: String },
+    InternalError(String),
+}
+
+impl TestLog {
+    pub fn outcome(&self) -> TestingOutcome {
+        match self {
+            Self::Success { .. } => TestingOutcome::Success,
+            Self::Timeout { .. } => TestingOutcome::Timeout,
+            Self::MemoryExceeded { .. } => TestingOutcome::MemoryExceeded,
+            Self::WrongOutput { .. } => TestingOutcome::WrongOutput,
+            Self::SlightlyWrongOutput { .. } => TestingOutcome::SlightlyWrongOutput,
+            Self::InternalError(..) => TestingOutcome::InternalError,
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct TestResult {
+    test_id: u64,
+    test_result: TestLog,
+}
+
+impl TestResult {
+    pub fn new(test_id: u64, test_result: TestLog) -> TestResult {
+        TestResult {
+            test_id,
+            test_result,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub enum ProgramResult {
+    CompilationProblem(String),
+    InternalProblem(String),
+    TestingResult {
+        testing_outcome: TestingOutcome,
+        tests: LinkedList<TestResult>,
+    },
+}
+
 fn main() {
     //TODO: Make other languages than c
     let test_language = std::env::var("TEST_LANGUAGE").unwrap();
@@ -32,6 +92,6 @@ fn main() {
 
     let _ = std::fs::write(
         format!("{}{}", crate::RESULT_PATH, crate::OUTPUT_NAME),
-        testing_result,
+        serde_json::to_string(&testing_result).unwrap(),
     );
 }

@@ -1,6 +1,6 @@
-use serde::Serialize;
 use std::{
     collections::LinkedList,
+    fmt::Display,
     io::{Read, Write},
     path::PathBuf,
     process::Command,
@@ -9,18 +9,11 @@ use std::{
 };
 use wait_timeout::ChildExt;
 
+use crate::{ProgramResult, TestLog, TestResult, TestingOutcome};
+
 enum CompilationResult {
     Successful,
     CompilationError(String),
-}
-
-#[derive(Serialize)]
-enum TestOutcome {
-    Success,
-    Timeout,
-    WrongOutput { expected: String, got: String },
-    SlightlyWrongOutput { expected: String, got: String },
-    InternalError,
 }
 
 enum TestError {
@@ -29,78 +22,60 @@ enum TestError {
     ReadingStdout,
 }
 
-#[derive(Serialize)]
-struct InitialError {
-    compilation_message: Option<String>,
-    internal_error: Option<String>,
-}
+impl Display for TestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::WritingStdin => "Problem while writing to stdin.",
+            Self::SignalKill => "Program killed by signal.",
+            Self::ReadingStdout => "Problem while reading from stdout.",
+        };
 
-#[derive(Serialize)]
-struct OneTestResult {
-    test_id: u64,
-    test_result: TestOutcome, // TODO: Memory and TIME
-}
-
-impl OneTestResult {
-    fn new(test_id: u64, test_result: TestOutcome) -> OneTestResult {
-        OneTestResult {
-            test_id,
-            test_result,
-        }
+        write!(f, "{text}")
     }
 }
 
-pub fn invoke_testing() -> String {
+pub fn invoke_testing() -> ProgramResult {
     // Compilation process and json result.
     match compile() {
         Ok(CompilationResult::Successful) => {}
         Ok(CompilationResult::CompilationError(error)) => {
-            return serde_json::to_string_pretty(&InitialError {
-                compilation_message: Some(error),
-                internal_error: None,
-            })
-            .unwrap();
+            return ProgramResult::CompilationProblem(error);
         }
         Err(error) => {
             println!("ERROR COMPILATION = {}", error);
-            return serde_json::to_string(&InitialError {
-                compilation_message: None,
-                internal_error: Some(error),
-            })
-            .unwrap();
+            return ProgramResult::InternalProblem(error);
         }
     }
 
     match run_testing() {
-        Err(error) => serde_json::to_string(&InitialError {
-            compilation_message: None,
-            internal_error: Some(error),
-        })
-        .unwrap(),
-        Ok(list) => serde_json::to_string(&list).unwrap(),
+        Err(error) => ProgramResult::InternalProblem(error),
+        Ok((list, outcome)) => ProgramResult::TestingResult {
+            testing_outcome: outcome,
+            tests: list,
+        },
     }
 }
 
-fn diff_result(expected: String, outcome: String) -> TestOutcome {
+fn analyse_result(expected: String, outcome: String, time: u64, memory: f64) -> TestLog {
     if expected == outcome {
-        return TestOutcome::Success;
+        return TestLog::Success { time, memory };
     }
 
     if expected.trim() == outcome {
-        return TestOutcome::SlightlyWrongOutput {
+        return TestLog::SlightlyWrongOutput {
             expected,
             got: outcome,
         };
     }
 
-    TestOutcome::WrongOutput {
+    TestLog::WrongOutput {
         expected,
         got: outcome,
     }
 }
 
 // TODO: ERROR PROOF
-fn test(in_file: &PathBuf, out_file: &PathBuf) -> Result<TestOutcome, TestError> {
+fn test(in_file: &PathBuf, out_file: &PathBuf) -> Result<TestLog, TestError> {
     let in_content = std::fs::read_to_string(in_file).unwrap();
     let out_content = std::fs::read_to_string(out_file).unwrap();
 
@@ -136,7 +111,7 @@ fn test(in_file: &PathBuf, out_file: &PathBuf) -> Result<TestOutcome, TestError>
 
                 match process_spawn.stdout.unwrap().read_to_string(&mut output) {
                     Err(_) => Err(TestError::ReadingStdout),
-                    Ok(_) => Ok(diff_result(out_content, output)),
+                    Ok(_) => Ok(analyse_result(out_content, output, 0, 0.0)),
                 }
             } else {
                 Err(TestError::SignalKill)
@@ -144,7 +119,9 @@ fn test(in_file: &PathBuf, out_file: &PathBuf) -> Result<TestOutcome, TestError>
         }
         None => {
             let _ = process_spawn.kill();
-            Ok(TestOutcome::Timeout)
+            Ok(TestLog::Timeout {
+                time_limit_millis: *crate::TESTING_TIMEOUT_TIME_MILLS,
+            })
         }
     }
 }
@@ -162,7 +139,7 @@ fn get_id(path: &std::path::Path) -> u64 {
         .unwrap()
 }
 
-fn run_testing() -> Result<LinkedList<OneTestResult>, String> {
+fn run_testing() -> Result<(LinkedList<TestResult>, TestingOutcome), String> {
     let files = match std::fs::read_dir(crate::TEST_PATH) {
         Ok(res) => res,
         Err(_) => {
@@ -192,7 +169,7 @@ fn run_testing() -> Result<LinkedList<OneTestResult>, String> {
         x_name.cmp(&y_name)
     });
 
-    let mut list: LinkedList<OneTestResult> = LinkedList::new();
+    let mut list: LinkedList<TestResult> = LinkedList::new();
 
     for file in in_files {
         let in_path = file;
@@ -203,21 +180,24 @@ fn run_testing() -> Result<LinkedList<OneTestResult>, String> {
         let test_id: u64 = get_id(&in_path);
 
         match test(&in_path, &out_path) {
-            Err(_) => {
-                list.push_back(OneTestResult::new(test_id, TestOutcome::InternalError));
-                break;
+            Err(error) => {
+                list.push_back(TestResult::new(
+                    test_id,
+                    TestLog::InternalError(error.to_string()),
+                ));
+                return Ok((list, TestingOutcome::InternalError));
             }
-            Ok(TestOutcome::Success) => {
-                list.push_back(OneTestResult::new(test_id, TestOutcome::Success));
+            Ok(TestLog::Success { time, memory }) => {
+                list.push_back(TestResult::new(test_id, TestLog::Success { time, memory }));
             }
             Ok(result) => {
-                list.push_back(OneTestResult::new(test_id, result));
-                break;
+                list.push_back(TestResult::new(test_id, result.clone()));
+                return Ok((list, result.outcome()));
             }
         }
     }
 
-    Ok(list)
+    Ok((list, TestingOutcome::Success))
 }
 
 fn compile() -> Result<CompilationResult, String> {
